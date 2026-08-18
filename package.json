@@ -1,0 +1,48 @@
+{
+  "name": "pons-terminal",
+  "version": "0.1.0",
+  "description": "Pons Terminal — multi-wallet Ponsfamily trading terminal for Robinhood Chain. Buy, sell, volume, and Multi-Wallet Sell All.",
+  "keywords": [
+    "pons",
+    "ponsfamily",
+    "pons-trading-bot",
+    "pons-bundler",
+    "pons-multi-wallet",
+    "pons-terminal",
+    "robinhood-chain",
+    "robinhood-chain-trading",
+    "crypto-trading-terminal",
+    "token-trading",
+    "volume-bot",
+    "multi-wallet-trading"
+  ],
+  "type": "module",
+  "bin": {
+    "hoodl": "./dist/cli/main.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./core": "./dist/core/index.js",
+    "./engine": "./dist/engine/index.js",
+    "./ui": "./dist/ui/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli/main.ts",
+    "terminal": "tsx src/ui/index.ts",
+    "ui": "npm run terminal",
+    "build": "tsc -p tsconfig.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "viem": "^2.55.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  },
+  "license": "MIT"
+}

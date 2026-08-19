@@ -62,7 +62,7 @@ npm install
 npm run terminal
 ```
 
-On first launch, Pons Terminal creates the local vault configuration it needs. The built-in HOODL routers are part of the application configuration, so you do not need to set or edit router addresses.
+On first launch, Pons Terminal creates the local vault configuration it needs.
 
 `npm run ui` remains available as an alias for existing installs. New documentation uses `npm run terminal`.
 
@@ -95,7 +95,6 @@ Pons Terminal charges a **0.5% HOODL trading fee per swap leg**.
 - A standard Volume cycle includes a Buy and a Sell, so both legs carry the fee.
 - Multi-Wallet Sell All includes transfer transactions plus one final sell leg; transfers are ERC-20 transfers and the final swap carries the trading fee.
 
-The HOODL router addresses are embedded in the application. They are intentionally not user-editable through `.env`; changing them can break route handling and fee settlement.
 
 ## First Session
 
@@ -164,9 +163,7 @@ If one wallet transfer fails, the others continue. The collection wallet still s
 > **Warning**  
 > Multi-Wallet Sell All submits real token transfers and swaps. Press `n` only when you intend to liquidate the selected token across every eligible wallet in the local vault.
 
-## Router Configuration
-
-Pons Terminal uses embedded HOODL router addresses for supported routes. Router addresses are intentionally not editable through `.env` because changing them can break route handling and fee settlement.
+## ENV Configuration
 
 The local `.env` is only for:
 
@@ -191,13 +188,15 @@ npm run build
 npm run terminal
 ```
 
-## Contact
+## Contact & Community
 
 Follow me on X for updates or feedback: [@420Congo](https://x.com/420Congo)
 
+Subscribe to HOODL_NEWS Telegram channel: [@HOODL_NEWS](https://t.me/HOODL_NEWS)
+
 ## Related Searches
 
-Pons Terminal shows up when people search GitHub for **Pons trading bot**, **Pons multi wallet**, **Pons bundler**, **Ponsfamily trading tool**, **Pons volume bot**, **Robinhood Chain trading bot**, **Robinhood Chain multi wallet**, **Robinhood Chain volume bot**, **Robinhood Chain DEX terminal**, and **crypto multi wallet terminal**. If you are looking for a focused terminal for trading tokens on Ponsfamily through several local wallets on Robinhood Chain, this is the project.
+Keywords: **Pons trading bot**, **Pons multi wallet**, **Pons bundler**, **Ponsfamily trading tool**, **Pons volume bot**, **Robinhood Chain trading bot**, **Robinhood Chain multi wallet**, **Robinhood Chain volume bot**, **Robinhood Chain DEX terminal**, and **crypto multi wallet terminal**. If you are looking for a focused terminal for trading tokens on Ponsfamily through several local wallets on Robinhood Chain, this is the project.
 
 ## License
 

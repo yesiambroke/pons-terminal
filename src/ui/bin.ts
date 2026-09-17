@@ -9,10 +9,16 @@ import {
   vaultLoad, vaultRemove, type VaultWallet,
 } from './keystore.js'
 import { loadPrefs, savePrefs } from './store.js'
+import { loadPositionState, savePositionState, type PositionState } from './positions-store.js'
 import { makePublicClient, makeWalletClient } from '../core/chain.js'
 import { dispatchTrade } from '../core/dispatch.js'
 import { getBalances, getBalancesBatch } from '../core/router.js'
-import { detectMarket, type DetectedMarket } from '../core/market.js'
+import { formatMarketCap, quoteHoldingValue, quoteMarketCap } from '../core/holding-value.js'
+import {
+  applyBuy, applySell, assessPosition, emptyPosition, entryMarketCapEth, evaluateTpSl, formatPnl, formatPnlPercent, moveTrackedTokens, positionKey, reconcilePosition, ruleSellAmount,
+  type TrackedPosition, type TpSlRule,
+} from '../core/positions.js'
+import { detectMarket, hasMarketRouteChanged, type DetectedMarket } from '../core/market.js'
 import { readCurveState, type CurveState } from '../core/curve.js'
 import { runCycle, type CycleConfig } from '../engine/cycle.js'
 import type { Row, ActionChip, UIRecord, TermSize, PanelFocus, JobView, VolumeWalletView } from './term.js'
@@ -21,11 +27,13 @@ import { ERC20_ABI } from '../core/abis.js'
 import { V2_HOODL_ROUTER, WETH } from '../config.js'
 import { formatRouteStatus } from './route-status.js'
 import { Executor, type Job, type JobParams } from '../engine/executor.js'
-import { buyPlanner, nukePlanner, sellPctPlanner } from '../engine/adapters.js'
+import { buyPlanner, nukePlanner, sellPctPlanner, trackedSellPlanner } from '../engine/adapters.js'
 import type { WalletDriver } from '../engine/driver.js'
 import { volumeDaemon } from '../engine/volume.js'
 import type { DispatchModal, BuyStrategy, LadderShape } from './dispatch.js'
-import { fieldsFor, parseCadence, toParams } from './dispatch.js'
+import {
+  createDispatchModal, fieldsFor, normalizeBuyAmount, normalizeSellPct, parseCadence, presetOrderParams, toParams,
+} from './dispatch.js'
 import type { WalletDialog } from './wallet-dialog.js'
 import { checkedWalletIds, commaSeparatedKeys, isWalletDialogConfirmed } from './wallet-dialog.js'
 import { copyText } from './clipboard.js'
@@ -38,6 +46,16 @@ function num(n: bigint): string {
   return `${whole}.${fraction.padEnd(6, '0').slice(0, 6)}`
 }
 function numF(n?: bigint): string { return n === undefined ? '--' : num(n) }
+
+function compactEth(n?: bigint): string {
+  if (n === undefined) return '—'
+  const value = Number(formatEther(n))
+  if (!Number.isFinite(value)) return '—'
+  for (const [divisor, suffix] of [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']] as const) {
+    if (Math.abs(value) >= divisor) return `${(value / divisor).toFixed(2)}${suffix} ETH`
+  }
+  return `${value.toFixed(6)} ETH`
+}
 
 export function compactToken(n?: bigint): string {
   if (n === undefined) return '--'
@@ -59,6 +77,10 @@ export function runApp(opts: RunOpts = {}): void {
   const client = makePublicClient()
   let wallets = vaultLoad()
   const initialPrefs = loadPrefs()
+  let positionState: PositionState = loadPositionState()
+  let positions = new Map<string, TrackedPosition>(positionState.positions.map((position) => [positionKey(position.walletId, position.token), position]))
+  let tpSlRules = new Map<string, TpSlRule>(positionState.rules.map((rule) => [positionKey(rule.walletId, rule.token), rule]))
+  const tpSlJobRules = new Map<string, string>()
   let token = initialPrefs.token
   let tokenName: string | undefined
   let tokenSymbol: string | undefined
@@ -66,10 +88,45 @@ export function runApp(opts: RunOpts = {}): void {
 
   // ── Engine: the scheduler every operation dispatches into ──────────────────
   const executor = new Executor({
-    onJob:    () => { buildRows(); renderNow() },
-    onEvent:  (_id, label) => logPush(label),
+    onJob: (job) => {
+      if ((job.state === 'done' || job.state === 'failed' || job.state === 'stopped') && tpSlJobRules.has(job.id)) {
+        const key = tpSlJobRules.get(job.id)!
+        const rule = tpSlRules.get(key)
+        if (rule) {
+          tpSlRules.set(key, rule)
+        }
+        tpSlJobRules.delete(job.id)
+      }
+      buildRows()
+      renderNow()
+    },
+    onEvent: (_id, label) => logPush(label),
     onProgress: () => renderNow(),
   })
+
+  function persistPositions() {
+    positionState = { positions: [...positions.values()], rules: [...tpSlRules.values()] }
+    savePositionState(positionState)
+  }
+
+  function positionFor(walletId: string, tokenAddress: `0x${string}`): TrackedPosition {
+    const key = positionKey(walletId, tokenAddress)
+    const existing = positions.get(key)
+    if (existing) return existing
+    const created = emptyPosition(walletId, tokenAddress)
+    positions.set(key, created)
+    return created
+  }
+
+  function recordSwap(walletId: string, tokenAddress: `0x${string}`, direction: 'buy' | 'sell', amountIn: bigint, amountOut: bigint) {
+    const key = positionKey(walletId, tokenAddress)
+    const before = positionFor(walletId, tokenAddress)
+    const next = direction === 'buy'
+      ? applyBuy(before, amountIn, amountOut)
+      : applySell(before, amountIn, amountOut)
+    positions.set(key, next)
+    persistPositions()
+  }
 
   /** Real WalletDriver: resolves vault signers + performs swaps. */
   function makeUIDriver(): WalletDriver {
@@ -80,6 +137,7 @@ export function runApp(opts: RunOpts = {}): void {
         const signer = privateKeyToAccount(vaultDecrypt(vw) as `0x${string}`)
         const wc = makeWalletClient(signer)
         const r = await dispatchTrade(wc, client, { token: opts.token, direction: opts.direction, amount: opts.amount, recipient: signer.address })
+        recordSwap(w.id, opts.token, opts.direction, opts.amount, r.amountOut)
         logPush(`${r.route} · ${r.hash.slice(0, 10)}…`)
         return { amountOut: r.amountOut, fee: r.fee, hash: r.hash }
       },
@@ -114,6 +172,19 @@ export function runApp(opts: RunOpts = {}): void {
         })
         const receipt = await client.waitForTransactionReceipt({ hash })
         if (receipt.status !== 'success') throw new Error('transfer reverted')
+        const recipient = wallets.find((wallet) => wallet.address.toLowerCase() === opts.to.toLowerCase())
+        if (recipient) {
+          const key = positionKey(w.id, opts.token)
+          const source = positions.get(key)
+          if (source) {
+            const destinationKey = positionKey(recipient.id, opts.token)
+            const destination = positions.get(destinationKey) ?? emptyPosition(recipient.id, opts.token)
+            const moved = moveTrackedTokens(source, destination, opts.amount)
+            positions.set(key, moved.from)
+            positions.set(destinationKey, moved.to)
+            persistPositions()
+          }
+        }
         return { hash }
       },
     }
@@ -125,10 +196,19 @@ export function runApp(opts: RunOpts = {}): void {
   let cursor = 0
   let input = ''
   let cursorPos = 0
+  let settingEdit: 'token' | 'buy' | 'sell' | null = null
   let tokenEdit = false
   let market: DetectedMarket | undefined
   let curveState: CurveState | undefined
   let routeError = ''
+  let holdingValue: string | undefined
+  let pnlSummary: string | undefined
+  let entryMarketCap: string | undefined
+  let walletPnl = new Map<string, string>()
+  let marketCap: string | undefined
+  let tokenSupply: bigint | undefined
+  let ethUsd: number | undefined
+  let ethUsdUpdatedAt = 0
   let busy = false
   let statusText = 'ready'
 
@@ -167,12 +247,15 @@ export function runApp(opts: RunOpts = {}): void {
   let jobCursor = 0
   let walletScroll: number | undefined = undefined   // wheel-driven scroll offset
   let gasMode: 'fast (+2gwei)' | 'turbo (+5gwei)' | 'normal (+0gwei)' = 'normal (+0gwei)'
-  let refreshRate: '3s' | '5s' | 'off' = '3s'
+  let tpSlAutomationEnabled = initialPrefs.tpSlAutomationEnabled === true
   let currentTheme: string = initialPrefs.theme || 'dark'
+  let defaultBuyAmount = initialPrefs.defaultBuyAmount || '0.001'
+  let defaultSellPct = initialPrefs.defaultSellPct || '50'
 
   const reducerActions = (n: number): ActionChip[] => [
     { key: 'b', label: `buy  x${n}` },
     { key: 's', label: `sell  x${n}` },
+    { key: 'k', label: 'TP / SL' },
     { key: 'v', label: 'volume' },
     { key: 'n', label: 'Sell All' },
     { key: 'i', label: 'import wallet' },
@@ -181,6 +264,7 @@ export function runApp(opts: RunOpts = {}): void {
   ]
 
   let refreshing = false   // true while a balance refresh is in flight
+  let refreshingMarket = false
 
   /** Wallet ids reserved by active volume daemons; excluded from ordinary trades. */
   function volumeWalletIds(): Set<string> {
@@ -214,6 +298,7 @@ export function runApp(opts: RunOpts = {}): void {
         (token || WETH) as `0x${string}`,
       )
       const reserved = volumeWalletIds()
+      await Promise.all([refreshHoldingValue(bal), refreshPnlAndTpSl(bal), refreshMarketCap()])
       rows = wallets.map((wallet) => {
         const balance = bal.get(wallet.id)
         return {
@@ -222,6 +307,7 @@ export function runApp(opts: RunOpts = {}): void {
           address: wallet.address,
           eth: `${numF(balance?.eth)} ETH`,
           token: `${compactToken(balance?.token)} TOK`,
+          pnl: walletPnl.get(wallet.id) ?? '--',
           reserved: reserved.has(wallet.id),
         }
       })
@@ -231,10 +317,155 @@ export function runApp(opts: RunOpts = {}): void {
     }
   }
 
+  async function refreshHoldingValue(balances: Map<string, { eth: bigint; weth: bigint; token: bigint }>) {
+    holdingValue = undefined
+    if (!token || !market || !wallets.length) return
+    const totalTokens = wallets.reduce((total, wallet) => total + (balances.get(wallet.id)?.token ?? 0n), 0n)
+    if (totalTokens === 0n) {
+      holdingValue = '~ 0.000000 ETH'
+      return
+    }
+    const holder = wallets[cursor]?.address as `0x${string}` | undefined
+    if (!holder) return
+    try {
+      const quote = await quoteHoldingValue(client, market, totalTokens, holder)
+      holdingValue = `~ ${num(quote.netEth)} ETH`
+      if (quote.curve) curveState = quote.curve
+    } catch {
+      holdingValue = 'unavailable'
+    }
+  }
+
+  async function refreshPnlAndTpSl(balances: Map<string, { eth: bigint; weth: bigint; token: bigint }>) {
+    pnlSummary = undefined
+    entryMarketCap = undefined
+    walletPnl = new Map()
+    if (!token || !market || !wallets.length) return
+    const tokenAddress = token as `0x${string}`
+    let totalCost = 0n
+    let totalTokens = 0n
+    let totalNet = 0n
+    let tracked = false
+    let changed = false
+
+    for (const wallet of wallets) {
+      const key = positionKey(wallet.id, tokenAddress)
+      const position = positions.get(key)
+      if (!position) continue
+      const liveTokens = balances.get(wallet.id)?.token ?? 0n
+      const reconciled = reconcilePosition(position, liveTokens)
+      if (reconciled.tokens !== position.tokens || reconciled.costEth !== position.costEth) {
+        positions.set(key, reconciled)
+        changed = true
+      }
+      if (reconciled.tokens <= 0n) continue
+      try {
+        const quote = await quoteHoldingValue(client, market, reconciled.tokens, wallet.address as `0x${string}`)
+        const assessment = assessPosition(reconciled, liveTokens, quote.netEth)
+        walletPnl.set(wallet.id, formatPnlPercent(assessment.pnlBps))
+        totalCost += assessment.costEth
+        totalTokens += assessment.trackedTokens
+        totalNet += assessment.netEth
+        tracked = true
+
+        const rule = tpSlRules.get(key)
+        const trigger = rule && !executor.isBusy(wallet.id) ? evaluateTpSl(assessment, rule, tpSlAutomationEnabled) : undefined
+        if (trigger) {
+          const sellAmount = ruleSellAmount(assessment, rule!)
+          if (sellAmount > 0n) {
+            rule!.triggered = trigger
+            tpSlRules.set(key, rule!)
+            persistPositions()
+            const id = executor.start('sellPct', [{ id: wallet.id, label: wallet.label }], {
+              token: tokenAddress, amount: sellAmount, note: trigger,
+            }, trackedSellPlanner(driver, tokenAddress))
+            tpSlJobRules.set(id, key)
+            logPush(`${wallet.label}: ${trigger} → sell ${rule!.sellPct}% tracked`)
+          }
+        }
+      } catch {
+        // A failed quote leaves the last displayed PnL intact until the next refresh.
+      }
+    }
+
+    if (changed) persistPositions()
+    if (tracked && totalCost > 0n && totalTokens > 0n) {
+      const pnlEth = totalNet - totalCost
+      pnlSummary = formatPnl(pnlEth, pnlEth * 10_000n / totalCost)
+      const entry = tokenSupply === undefined ? undefined : entryMarketCapEth(totalCost, totalTokens, tokenSupply)
+      entryMarketCap = entry === undefined ? 'untracked' : formatMarketCap(entry, ethUsd)
+    } else if (token) {
+      pnlSummary = 'untracked'
+      entryMarketCap = 'untracked'
+    }
+  }
+
+  async function refreshMarketCap() {
+    marketCap = undefined
+    if (!token || !market || tokenSupply === undefined) return
+    const holder = wallets[cursor]?.address as `0x${string}` ?? '0x0000000000000000000000000000000000000000'
+    try {
+      const cap = await quoteMarketCap(client, market, tokenSupply, holder)
+      const now = Date.now()
+      if (!ethUsd || now - ethUsdUpdatedAt > 60_000) {
+        try {
+          const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd')
+          const body = await response.json() as { ethereum?: { usd?: unknown } }
+          if (typeof body.ethereum?.usd === 'number' && body.ethereum.usd > 0) {
+            ethUsd = body.ethereum.usd
+            ethUsdUpdatedAt = now
+          }
+        } catch {
+          // Keep the route-derived ETH cap visible if USD pricing is temporarily unavailable.
+        }
+      }
+      marketCap = formatMarketCap(cap.marketCapEth, ethUsd)
+    } catch {
+      marketCap = 'unavailable'
+    }
+  }
+
+  async function refreshMarketRoute() {
+    if (refreshingMarket || !token) return
+    refreshingMarket = true
+    const tokenAddress = token as `0x${string}`
+    try {
+      const resolved = await detectMarket(client, tokenAddress)
+      if (token !== tokenAddress) return
+      const changed = hasMarketRouteChanged(market, resolved)
+      market = resolved
+      routeError = ''
+      if (resolved.kind === 'v2-curve') {
+        const recipient = wallets[cursor]?.address as `0x${string}` | undefined
+        curveState = recipient ? await readCurveState(client, resolved.curve, recipient) : undefined
+      } else {
+        curveState = undefined
+      }
+      if (changed) {
+        holdingValue = undefined
+        marketCap = undefined
+        logPush(`route → ${resolved.kind}`)
+        void refreshRows()
+        void refreshMarketCap()
+      }
+    } catch (e) {
+      if (token === tokenAddress) routeError = (e as Error).message
+    } finally {
+      refreshingMarket = false
+      renderNow()
+    }
+  }
+
   async function refreshMarketState() {
     market = undefined
     curveState = undefined
     routeError = ''
+    holdingValue = undefined
+    pnlSummary = undefined
+    entryMarketCap = undefined
+    walletPnl = new Map()
+    marketCap = undefined
+    tokenSupply = undefined
     tokenName = undefined
     tokenSymbol = undefined
     if (!token) return
@@ -245,17 +476,21 @@ export function runApp(opts: RunOpts = {}): void {
         Promise.allSettled([
           client.readContract({ address: tokenAddress, abi: ERC20_ABI, functionName: 'name' }),
           client.readContract({ address: tokenAddress, abi: ERC20_ABI, functionName: 'symbol' }),
+          client.readContract({ address: tokenAddress, abi: ERC20_ABI, functionName: 'totalSupply' }),
         ]),
       ])
-      const [nameResult, symbolResult] = metadata
+      const [nameResult, symbolResult, supplyResult] = metadata
       if (nameResult?.status === 'fulfilled' && typeof nameResult.value === 'string') tokenName = nameResult.value
       if (symbolResult?.status === 'fulfilled' && typeof symbolResult.value === 'string') tokenSymbol = symbolResult.value
+      if (supplyResult?.status === 'fulfilled' && typeof supplyResult.value === 'bigint') tokenSupply = supplyResult.value
       market = resolved
       if (resolved.kind === 'v2-curve') {
         const recipient = wallets[cursor]?.address as `0x${string}` | undefined
         if (recipient) curveState = await readCurveState(client, resolved.curve, recipient)
       }
       logPush(`route → ${resolved.kind}`)
+      void refreshRows()
+      void refreshMarketCap()
     } catch (e) {
       routeError = (e as Error).message
       logPush(`route unavailable: ${routeError}`)
@@ -282,13 +517,15 @@ export function runApp(opts: RunOpts = {}): void {
       actions: reducerActions(checks.size),
       feedback: activityLog,
       logScroll,
-      input: { value: input, cursor: cursorPos, prompt: tokenEdit ? 'token CA' : 'cmd' },
+      input: { value: input, cursor: cursorPos, prompt: settingEdit === 'token' ? 'token CA' : settingEdit === 'buy' ? 'default buy ETH' : settingEdit === 'sell' ? 'default sell %' : 'cmd' },
       focus: panel,
       actionCursor,
       settingsCursor,
       gasMode,
-      refreshRate,
+      tpSlAutomationEnabled,
       theme: currentTheme,
+      defaultBuyAmount,
+      defaultSellPct,
       /** mirror the engine's jobs into the JOBS panel */
       jobs: jobsSnapshot(),
       volumeWallets: volumeWalletSnapshot(),
@@ -301,6 +538,10 @@ export function runApp(opts: RunOpts = {}): void {
       routeDetail: route.detail,
       routeMarket: route.market,
       routeBlocked: route.blocked,
+      holdingValue,
+      pnlSummary,
+      entryMarketCap,
+      marketCap,
       modalEdit: modalEdit ?? undefined,
       modalBlink,
     }
@@ -374,6 +615,15 @@ export function runApp(opts: RunOpts = {}): void {
     return wallets[cursor]
   }
 
+  function beginSettingEdit(kind: 'token' | 'buy' | 'sell') {
+    settingEdit = kind
+    tokenEdit = kind === 'token'
+    input = kind === 'token' ? '' : kind === 'buy' ? defaultBuyAmount : defaultSellPct
+    cursorPos = input.length
+    panel = 'token'
+    renderNow()
+  }
+
   function openWalletDialog(kind: WalletDialog['kind']) {
     if (kind === 'import') {
       walletDialog = { kind, value: '' }
@@ -413,11 +663,42 @@ export function runApp(opts: RunOpts = {}): void {
 
   // ── DISPATCH modal lifecycle ────────────────────────────────────────────────
   function openModal(kind: DispatchModal['kind']) {
-    modal = { kind, cursor: 0 } as DispatchModal
+    modal = createDispatchModal(kind, { defaultBuyAmount, defaultSellPct })
     modalEdit = null
     renderNow()
   }
   function closeModal() { modal = null; modalEdit = null; stopBlink(); renderNow() }
+
+  function dispatchPreset(kind: 'buy' | 'sell') {
+    if (!token) { logPush(`${kind} preset: set a token first (t)`); renderNow(); return }
+    const route = routeStatus()
+    if (route.blocked) { logPush(`${kind} preset: ${route.blocked}`); renderNow(); return }
+    const selected = wallets.filter((_, index) => checks.has(index))
+    const reserved = volumeWalletIds()
+    const targets = selected.filter((wallet) => !reserved.has(wallet.id))
+    if (!targets.length) {
+      const detail = selected.length ? 'selected wallets are dedicated to volume' : 'no wallets selected'
+      logPush(`${kind} preset: ${detail}`)
+      renderNow()
+      return
+    }
+    if (targets.length !== selected.length) {
+      logPush(`preset ${kind}: skipped ${selected.length - targets.length} volume-reserved wallet${selected.length - targets.length === 1 ? '' : 's'}`)
+    }
+    const params = presetOrderParams(kind, { defaultBuyAmount, defaultSellPct })
+    const wids = targets.map((wallet) => ({ id: wallet.id, label: wallet.label }))
+    if (kind === 'buy') {
+      executor.start('ladderBuy', wids, { ...params, token, note: `preset ${defaultBuyAmount} ETH` }, buyPlanner(driver, token))
+      logPush(`preset buy · ${defaultBuyAmount} ETH × ${wids.length}`)
+    } else {
+      executor.start('sellPct', wids, { ...params, token, note: `preset ${defaultSellPct}%` }, sellPctPlanner(driver, token))
+      logPush(`preset sell · ${defaultSellPct}% × ${wids.length}`)
+    }
+    busy = true
+    statusText = `${kind} preset dispatched`
+    renderNow()
+    void refreshRows()
+  }
 
   /** Confirm → dispatch a job from the modal's params, then close. */
   function dispatchModal() {
@@ -451,7 +732,20 @@ export function runApp(opts: RunOpts = {}): void {
     const tok  = token
     const p    = toParams(modal)
 
-    if (name === 'buy') {
+    if (name === 'tpsl') {
+      for (const wallet of targets) {
+        const key = positionKey(wallet.id, tok as `0x${string}`)
+        tpSlRules.set(key, {
+          walletId: wallet.id,
+          token: tok as `0x${string}`,
+          takeProfitPct: p.takeProfitPct!,
+          stopLossPct: p.stopLossPct!,
+          sellPct: p.sellPct!,
+        })
+      }
+      persistPositions()
+      logPush(`TP/SL · ${wids.length} wallet${wids.length === 1 ? '' : 's'} · +${p.takeProfitPct}% / -${p.stopLossPct}% · ${p.sellPct}% tracked`)
+    } else if (name === 'buy') {
       executor.start('ladderBuy', wids, { ...p, token: tok, note: modal.strategy ?? 'buy' }, buyPlanner(driver, tok))
     } else if (name === 'sell') {
       executor.start('sellPct', wids, { ...p, token: tok }, sellPctPlanner(driver, tok))
@@ -495,7 +789,7 @@ export function runApp(opts: RunOpts = {}): void {
     const actions = reducerActions(checks.size)
     const a = actions[actionCursor]
     if (!a) return
-    const map: Record<string, DispatchModal['kind']> = { b: 'buy', s: 'sell', v: 'volume' }
+    const map: Record<string, DispatchModal['kind']> = { b: 'buy', s: 'sell', k: 'tpsl', v: 'volume' }
     if (a.key === 'n') { nukeNow(); return }
     const name = map[a.key]
     if (name) openModal(name)
@@ -577,6 +871,9 @@ export function runApp(opts: RunOpts = {}): void {
     else if (key === 'factor') m.factor = value
     else if (key === 'list') m.list = value
     else if (key === 'pct') m.pct = value
+    else if (key === 'sellPct') m.sellPct = value
+    else if (key === 'takeProfit') m.takeProfit = value
+    else if (key === 'stopLoss') m.stopLoss = value
     else if (key === 'cadence') m.cadence = value
     else if (key === 'cycles') m.cycles = value
   }
@@ -687,19 +984,35 @@ export function runApp(opts: RunOpts = {}): void {
       return
     }
 
-    // ── Token edit mode (captures all input) ──────────────────────────────────
-    if (tokenEdit) {
-      if (key.esc) { tokenEdit = false; input = ''; statusText = 'ready'; renderNow(); return }
+    // ── Editable Settings (token/default buy/default sell) ────────────────────
+    if (settingEdit) {
+      if (key.esc) { settingEdit = null; tokenEdit = false; input = ''; statusText = 'ready'; renderNow(); return }
       if (key.enter) {
-        if (isAddress(input.trim() as `0x${string}`)) {
-          token = input.trim()
-          savePrefs({ token })
-          logPush(`token → ${token.slice(0, 6)}…`)
-          statusText = 'token set'
-          void refreshMarketState()
+        try {
+          if (settingEdit === 'token') {
+            if (!isAddress(input.trim() as `0x${string}`)) throw new Error('invalid CA')
+            token = input.trim()
+            savePrefs({ token })
+            logPush(`token → ${token.slice(0, 6)}…`)
+            statusText = 'token set'
+            void refreshMarketState()
+          } else if (settingEdit === 'buy') {
+            defaultBuyAmount = normalizeBuyAmount(input)
+            savePrefs({ defaultBuyAmount })
+            logPush(`default buy → ${defaultBuyAmount} ETH`)
+          } else {
+            defaultSellPct = normalizeSellPct(input)
+            savePrefs({ defaultSellPct })
+            logPush(`default sell → ${defaultSellPct}%`)
+          }
+          settingEdit = null
+          tokenEdit = false
+          input = ''
+          cursorPos = 0
+        } catch (error) {
+          statusText = (error as Error).message
         }
-        else { logPush('invalid CA'); statusText = 'invalid CA' }
-        input = ''; cursorPos = 0; tokenEdit = false; return
+        return
       }
       if (key.backspace) { input = input.slice(0, cursorPos - 1) + input.slice(cursorPos); cursorPos = Math.max(0, cursorPos - 1) }
       else if (key.left) cursorPos = Math.max(0, cursorPos - 1)
@@ -732,9 +1045,12 @@ export function runApp(opts: RunOpts = {}): void {
     }
 
     // Letter hotkeys — always available regardless of panel
-    if (c === 't') { tokenEdit = true; input = ''; cursorPos = 0; panel = 'token'; return }
+    if (c === 't') { beginSettingEdit('token'); return }
+    if (c === '[') { dispatchPreset('buy'); return }
+    if (c === ']') { dispatchPreset('sell'); return }
     if (c === 'b') { openModal('buy'); return }
     if (c === 's') { openModal('sell'); return }
+    if (c === 'k') { openModal('tpsl'); return }
     if (c === 'v') { openModal('volume'); return }
     if (c === 'n') { nukeNow(); return }
     if (c === 'c' && panel === 'wallets') {
@@ -766,7 +1082,7 @@ export function runApp(opts: RunOpts = {}): void {
       } catch (e) { logPush(`✗ ${(e as Error).message}`); renderNow() }
       return
     }
-    if (c === '?' || c === 'h') { logPush('b buy · s sell · v volume · n Sell All · i import · e export · d delete · a all · g gen · tab panel · x stop · p pause · r resume · q quit'); return }
+    if (c === '?' || c === 'h') { logPush('b buy · s sell · k TP/SL · v volume · n Sell All · i import · e export · d delete · a all · g gen · tab panel · x stop · p pause · r resume · q quit'); return }
     if (c === 'q') return quit()
 
     // Job control — GLOBAL keys (work from any panel, target the focused/newest job)
@@ -788,16 +1104,21 @@ export function runApp(opts: RunOpts = {}): void {
       if (key.up)   { settingsCursor = settingsCursor <= 0 ? maxSetting : settingsCursor - 1; return }
       if (key.down) { settingsCursor = settingsCursor >= maxSetting ? 0 : settingsCursor + 1; return }
       if (key.enter || key.space) {
-        if (settingsCursor === 0) { tokenEdit = true; input = ''; cursorPos = 0 }
-        else if (settingsCursor === 1) {
+        if (settingsCursor === 0) beginSettingEdit('token')
+        else if (settingsCursor === 1) beginSettingEdit('buy')
+        else if (settingsCursor === 2) beginSettingEdit('sell')
+        else if (settingsCursor === 3) {
           const modes: Array<'fast (+2gwei)' | 'turbo (+5gwei)' | 'normal (+0gwei)'> = ['fast (+2gwei)', 'turbo (+5gwei)', 'normal (+0gwei)']
           gasMode = modes[(modes.indexOf(gasMode) + 1) % modes.length]
           logPush(`gas mode → ${gasMode}`)
-        } else if (settingsCursor === 2) {
-          const rates: Array<'3s' | '5s' | 'off'> = ['3s', '5s', 'off']
-          refreshRate = rates[(rates.indexOf(refreshRate) + 1) % rates.length]
-          logPush(`auto refresh → ${refreshRate}`)
-        } else if (settingsCursor === 3) {
+        } else if (settingsCursor === 4) {
+          tpSlAutomationEnabled = !tpSlAutomationEnabled
+          savePrefs({ tpSlAutomationEnabled })
+          if (!tpSlAutomationEnabled) {
+            for (const id of tpSlJobRules.keys()) executor.stop(id)
+          }
+          logPush(`TP/SL automation → ${tpSlAutomationEnabled ? 'on' : 'off'}`)
+        } else if (settingsCursor === 5) {
           const themes = ['dark', 'tokyo-night', 'obsidian-gold', 'sunset-synth', 'cyberpunk', 'dracula', 'matrix', 'nord']
           currentTheme = themes[(themes.indexOf(currentTheme) + 1) % themes.length]
           savePrefs({ theme: currentTheme })
@@ -915,7 +1236,7 @@ export function runApp(opts: RunOpts = {}): void {
 
   /** Move a specific panel's selection by dir (clamped at the ends). */
   function moveSlideFor(which: string, dir: number) {
-    if (which === 'token') { settingsCursor = Math.min(3, Math.max(0, settingsCursor + dir)); return }
+    if (which === 'token') { settingsCursor = Math.min(5, Math.max(0, settingsCursor + dir)); return }
     if (which === 'actions') {
       const n = reducerActions(0).length
       actionCursor = Math.min(Math.max(0, n - 1), Math.max(0, actionCursor + dir)); return
@@ -964,10 +1285,11 @@ export function runApp(opts: RunOpts = {}): void {
     const walletEnd  = ci1 + 2   // last wallet column (inclusive)
     const settingEnd = ci1 + ci2 + 5   // last settings column (inclusive)
 
-    if (tokenEdit) {
+    if (settingEdit) {
       if (btn === 0 && isPress) {
-        // Click outside Settings panel cancels tokenEdit
+        // Click outside Settings panel cancels the active settings edit.
         if (col <= walletEnd || col > settingEnd || row > view + 2) {
+          settingEdit = null
           tokenEdit = false
           input = ''
           statusText = 'ready'
@@ -1029,17 +1351,27 @@ export function runApp(opts: RunOpts = {}): void {
           if (sIdx !== undefined) {
             settingsCursor = sIdx
             if (sIdx === 0) {
-              tokenEdit = true
-              input = ''
-              cursorPos = 0
+              beginSettingEdit('token')
             } else if (sIdx === 1) {
+              beginSettingEdit('buy')
+            } else if (sIdx === 2) {
+              beginSettingEdit('sell')
+            } else if (sIdx === 3) {
               const modes: Array<'fast (+2gwei)' | 'turbo (+5gwei)' | 'normal (+0gwei)'> = ['fast (+2gwei)', 'turbo (+5gwei)', 'normal (+0gwei)']
               gasMode = modes[(modes.indexOf(gasMode) + 1) % modes.length]
               logPush(`gas mode → ${gasMode}`)
-            } else if (sIdx === 2) {
-              const rates: Array<'3s' | '5s' | 'off'> = ['3s', '5s', 'off']
-              refreshRate = rates[(rates.indexOf(refreshRate) + 1) % rates.length]
-              logPush(`auto refresh → ${refreshRate}`)
+            } else if (sIdx === 4) {
+              tpSlAutomationEnabled = !tpSlAutomationEnabled
+              savePrefs({ tpSlAutomationEnabled })
+              if (!tpSlAutomationEnabled) {
+                for (const id of tpSlJobRules.keys()) executor.stop(id)
+              }
+              logPush(`TP/SL automation → ${tpSlAutomationEnabled ? 'on' : 'off'}`)
+            } else if (sIdx === 5) {
+              const themes = ['dark', 'tokyo-night', 'obsidian-gold', 'sunset-synth', 'cyberpunk', 'dracula', 'matrix', 'nord']
+              currentTheme = themes[(themes.indexOf(currentTheme) + 1) % themes.length]
+              savePrefs({ theme: currentTheme })
+              logPush(`theme → ${currentTheme}`)
             }
           }
           renderNow()
@@ -1070,7 +1402,10 @@ export function runApp(opts: RunOpts = {}): void {
   renderNow()                  // paint the shell RIGHT AWAY — no waiting on balances
   void refreshRows()           // balances stream in behind the UI (⟳ syncing…)
   void refreshMarketState()    // venue/taxes stream in behind the UI
-  const refreshTimer = setInterval(() => { void refreshRows() }, 3000)   // auto-refresh
+  const refreshTimer = setInterval(() => {
+    void refreshRows()
+    void refreshMarketRoute()
+  }, 3000)
   process.stdout.on('resize', renderNow)
 
   // ── Input parser ────────────────────────────────────────────────────────────

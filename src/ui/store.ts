@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url'
 export interface Prefs {
   token: string
   theme?: string
+  defaultBuyAmount?: string
+  defaultSellPct?: string
+  tpSlAutomationEnabled?: boolean
 }
 
 const ROOT = dirname(fileURLToPath(import.meta.url))

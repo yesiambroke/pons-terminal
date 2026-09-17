@@ -51,6 +51,10 @@ export function classifyV2Launch(record: V2LaunchRecord): MarketRoute {
   throw new Error(`unknown V2 launch phase: ${record.phase}`)
 }
 
+export function hasMarketRouteChanged(previous: DetectedMarket | undefined, next: DetectedMarket): boolean {
+  return previous?.kind !== next.kind
+}
+
 /** Resolve a token into the route the HOODL router must execute. */
 export async function detectMarket(client: PublicClientT, token: Address): Promise<DetectedMarket> {
   const record = await (client as any).readContract({

@@ -382,12 +382,12 @@ export function buildV4ExecuteCall(
   p: { token: Address; tokenIn: Address; tokenOut: Address; grossAmountIn: bigint; minGrossOut: bigint; recipient: Address; tickSpacing: number; hook?: Address },
   slippageBps: bigint = SLIPPAGE,
 ) {
-  const route = buildV4ExactInput(p)
+  const grossMinOut = p.minGrossOut - p.minGrossOut * slippageBps / 10000n
+  const route = buildV4ExactInput({ ...p, minGrossOut: grossMinOut })
   const nativeIn = p.tokenIn === NATIVE_ETH
-  const quotedNetOut = route.tokenOut === NATIVE_ETH
-    ? p.minGrossOut - p.minGrossOut * FEE_BPS / 10000n
-    : p.minGrossOut
-  const minOut = quotedNetOut - quotedNetOut * slippageBps / 10000n
+  const minOut = route.tokenOut === NATIVE_ETH
+    ? grossMinOut - grossMinOut * FEE_BPS / 10000n
+    : grossMinOut
   return {
     address: router,
     abi: TRADE_ROUTER_V2_ABI,

@@ -165,6 +165,28 @@ export function buyPlanner(driver: WalletDriver, token: string): {
   }
 }
 
+/** Planner for an exact terminal-tracked token amount, used by TP/SL only. */
+export function trackedSellPlanner(driver: WalletDriver, token: string): {
+  type: 'sellPct'
+  plan: (w: Wallet[], p: JobParams) => Promise<Leg[]>
+} {
+  return {
+    type: 'sellPct',
+    plan: async (wallets, params) => {
+      const amount = params.amount ?? 0n
+      if (amount <= 0n) throw new Error('TP/SL: no tracked tokens to sell')
+      const tok = toHex(params.token ?? token)
+      return wallets.map((wallet) => ({
+        wallet,
+        run: async () => {
+          const out = await driver.swap(wallet, { token: tok, direction: 'sell', amount })
+          return { ok: true, label: formatTradeLabel(wallet.id, 'sell', amount, out.amountOut) }
+        },
+      }))
+    },
+  }
+}
+
 /** Planner for a SELL of `pct`% of each wallet's held tokens. */
 export function sellPctPlanner(driver: WalletDriver, token: string): {
   type: 'sellPct'

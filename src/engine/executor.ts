@@ -53,6 +53,9 @@ export interface JobParams {
   cadence?: [number, number]
   pct?: number
   cycles?: number
+  takeProfitPct?: number
+  stopLossPct?: number
+  sellPct?: number
   /** Fixed sink for deterministic tests; production nuke picks randomly. */
   sinkId?: string
   /** optional short human label shown in the JOBS panel row */

@@ -16,6 +16,8 @@ export interface Row {
   address?: string
   eth?: string
   token?: string
+  /** Live open-position PnL percentage for this wallet's tracked token tranche. */
+  pnl?: string
   reserved?: boolean
   status?: 'sel' | 'check' | 'err' | 'ok' | 'busy' | 'dim'
 }
@@ -62,8 +64,10 @@ export interface UIRecord {
   actionCursor?: number
   settingsCursor?: number
   gasMode?: string
-  refreshRate?: string
   theme?: string
+  defaultBuyAmount?: string
+  defaultSellPct?: string
+  tpSlAutomationEnabled?: boolean
   jobs?: JobView[]
   volumeWallets?: VolumeWalletView[]
   /** Index into `jobs` of the focused job (JOBS panel highlight). */
@@ -82,12 +86,20 @@ export interface UIRecord {
   routeDetail?: string
   routeMarket?: string
   routeBlocked?: string
+  /** Aggregate current-token sell estimate across local vault wallets. */
+  holdingValue?: string
+  /** Current net PnL across all open terminal-tracked wallet positions. */
+  pnlSummary?: string
+  /** Market cap implied by the weighted open terminal entry basis. */
+  entryMarketCap?: string
+  /** Estimated fully diluted market cap in ETH from the active route quote. */
+  marketCap?: string
 }
 
 export interface TermSize { cols: number; rows: number }
 
 /** Physical SETTINGS lines that are actual controls, not read-only route status. */
-export const SETTINGS_INTERACTIVE_ROWS = [1, 6, 7, 8] as const
+export const SETTINGS_INTERACTIVE_ROWS = [0, 6, 7, 8, 9, 10] as const
 
 export function settingsRowForCursor(cursor: number): number {
   return SETTINGS_INTERACTIVE_ROWS[Math.max(0, Math.min(cursor, SETTINGS_INTERACTIVE_ROWS.length - 1))]!
@@ -233,8 +245,19 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
     paintCell(b, x, 2, cw2, x2, T.BGH, T); x += cw2 + 1
     paintCell(b, x, 2, cw3, x3, T.BGH, T)
   }
-  // WALLETS uses fixed columns so the header and changing balance widths stay aligned.
-  const wHeader = '  [v]  #  NAME      ADDRESS                                     ETH             TOKEN'
+  // WALLETS headers and rows share an explicit column model. Numeric headings
+  // use the same right edge as their changing values to avoid visual drift.
+  const walletColumns = L.ci1 >= 115
+    ? { name: 8, address: 42, eth: 12, token: 10, pnl: 7 }
+    : L.ci1 >= 70
+      ? { name: 8, address: 17, eth: 12, token: 10, pnl: 7 }
+      : { name: 5, address: 17, token: 7, pnl: 7 }
+  const fitLeft = (value: string, width: number): string => clipText(value, width).padEnd(width)
+  const fitRight = (value: string, width: number): string => clipText(value, width).padStart(width)
+  const walletValue = (value: string, unit: string): string => value.endsWith(` ${unit}`) ? value.slice(0, -unit.length - 1) : value
+  const wHeader = 'eth' in walletColumns
+    ? `  [v]  #  ${fitLeft('NAME', walletColumns.name)}  ${fitLeft('ADDRESS', walletColumns.address)}  ${fitRight('ETH', walletColumns.eth!)}  ${fitRight('TOKEN', walletColumns.token)} ${fitRight('PNL', walletColumns.pnl)}`
+    : `  [v]  #  ${fitLeft('NAME', walletColumns.name)}  ${fitLeft('ADDRESS', walletColumns.address)} ${fitRight('TOKEN', walletColumns.token)} ${fitRight('PNL', walletColumns.pnl)}`
   titleRow(wHeader, '  SETTINGS', '  ACTIONS', L.ci1 + 2, L.ci2 + 2, L.ci3 + 2)
 
   // ── body: 3 top panels, view-1 rows, BGS gutters between every panel ──────
@@ -253,11 +276,19 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
     const badge = r.reserved ? '[VOL]' : (checked ? '[✓] ' : '[ ] ')
     if (!r.address) return `${mark} ${badge} ${r.label}`
     if (r.reserved) return `${mark} ${badge} ${r.name ?? 'wallet'}  dedicated · see VOLUME WALLETS`
+    const address = L.ci1 >= 115 ? r.address : shortAddress(r.address)
     const number = `${index + 1}`.padStart(2)
-    const name = (r.name ?? '').slice(0, 8).padEnd(8)
-    const eth = (r.eth ?? '–').padStart(12)
-    const token = (r.token ?? '–').padStart(12)
-    return `${mark} ${badge} ${number}  ${name}  ${r.address}  ${eth}  ${token}`
+    const prefix = `${mark} ${badge} ${number} `
+    const name = fitLeft(r.name ?? '', walletColumns.name)
+    const addressCell = fitLeft(address, walletColumns.address)
+    const pnl = fitRight(r.pnl ?? '--', walletColumns.pnl)
+    if (!('eth' in walletColumns)) {
+      const token = fitRight(walletValue(r.token ?? '–', 'TOK'), walletColumns.token)
+      return `${prefix}${name}  ${addressCell} ${token} ${pnl}`
+    }
+    const eth = fitRight(walletValue(r.eth ?? '–', 'ETH'), walletColumns.eth!)
+    const token = fitRight(walletValue(r.token ?? '–', 'TOK'), walletColumns.token)
+    return `${prefix}${name}  ${addressCell}  ${eth}  ${token} ${pnl}`
   }
   for (let bi = 0; bi < L.view - 1; bi++) {
     const idx = start + bi
@@ -273,23 +304,28 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
 
   // settings content
   const setLines: string[] = []
-  const isEditing = s.input.prompt === 'token CA'
+  const isEditing = s.input.prompt !== 'cmd'
   if (isEditing) {
-    setLines.push(`  ▍ TOKEN CONTRACT ADDRESS`, `  ${s.input.value || ' '}`, '', `  ⏎ Save   Esc Cancel`)
+    const editTitle = s.input.prompt === 'token CA'
+      ? 'TOKEN CONTRACT ADDRESS'
+      : s.input.prompt === 'default buy ETH'
+        ? 'DEFAULT BUY AMOUNT (ETH)'
+        : 'DEFAULT SELL PERCENTAGE'
+    setLines.push(`  ▍ ${editTitle}`, `  ${s.input.value || ' '}`, '', `  ⏎ Save   Esc Cancel`)
   } else {
-    const ticker = clipText(s.tokenSymbol ?? 'TOKEN', 10)
-    const name = clipText(s.tokenName ?? 'Unknown token', 38)
     const contract = s.token ? shortAddress(s.token) : 'Set Token CA'
     const LBL = (l: string) => `  ${l.padEnd(5)}  `
     setLines.push(
       `${LBL('CA')}${contract}`,
-      `${LBL('Token')}${s.token ? `${ticker} (${name})` : 'Set Token CA'}`,
-      `${LBL('Route')}${s.routeLabel ?? 'detecting…'}`,
-      `  ${s.routeDetail ?? ''}`,
-      `${LBL('Curve')}${s.routeMarket ?? ''}`,
-      `  ${s.routeBlocked ?? ''}`,
+      `${LBL('Route')}${s.routeLabel?.replaceAll(' / ', '/') ?? 'detecting…'}${s.routeDetail ? ` · ${s.routeDetail.match(/\d+\.\d+%/)?.[0] ?? ''}` : ''}`,
+      `${LBL('PnL')}${s.pnlSummary ?? 'untracked'}`,
+      `${LBL('Entry MC')}${s.entryMarketCap ?? 'untracked'}`,
+      `${LBL('Value')}${s.holdingValue ?? (s.routeBlocked ? 'unavailable' : '—')}`,
+      `${LBL('MCap')}${s.marketCap ?? (s.routeBlocked ? 'unavailable' : '—')}`,
+      `${LBL('Buy')}${s.defaultBuyAmount ?? '0.001'} ETH`,
+      `${LBL('Sell')}${s.defaultSellPct ?? '50'}%`,
       `${LBL('Gas')}${s.gasMode ?? 'fast'}`,
-      `${LBL('Auto')}${s.refreshRate ?? '3s'}`,
+      `${LBL('TP/SL')}${s.tpSlAutomationEnabled ? 'on' : 'off'}`,
       `${LBL('Theme')}${themeName}`,
     )
   }
@@ -418,10 +454,14 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
   }
 
   // ── help bar ──────────────────────────────────────────────────────────────
-  const keys: [string, string][] = [
-    ['↑↓', 'navigate'], ['space', 'select'], ['a', 'all'], ['g', 'gen'], ['t', 'token'],
-    ['b', 'buy'], ['s', 'sell'], ['v', 'vol'], ['n', 'Sell All'], ['tab', 'focus'], ['q', 'quit'],
-  ]
+  const keys: [string, string][] = tw >= 150
+    ? [
+      ['↑↓', 'navigate'], ['space', 'select'], ['a', 'all'], ['g', 'gen'], ['t', 'token'],
+      ['b', 'buy'], ['s', 'sell'], ['[', 'preset buy'], [']', 'preset sell'], ['n', 'Sell All'], ['k', 'TP/SL'], ['v', 'vol'], ['tab', 'focus'], ['q', 'quit'],
+    ]
+    : [
+      ['↑↓', 'nav'], ['space', 'select'], ['b', 'buy'], ['s', 'sell'], ['[', 'buy'], [']', 'sell'], ['n', 'Sell All'], ['k', 'TP/SL'], ['v', 'vol'], ['q', 'quit'],
+    ]
   const helpStr = keys.map(([k, v]) => `${k} ${v}`).join('  ·  ')
   const hy = byY + L.act + 1            // spacer row after bottom body, then help
   b.fillRect(0, hy, tw, 1, T.BGH)

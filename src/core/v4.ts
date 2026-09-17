@@ -21,6 +21,7 @@ const EXACT_INPUT_SINGLE = parseAbiParameters(
   '((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,uint256 minHopPriceX36,bytes hookData)',
 )
 const SETTLE_ALL = parseAbiParameters('address currency, uint256 amount')
+const SETTLE = parseAbiParameters('address currency, uint256 amount, bool payerIsUser')
 const TAKE_ALL = parseAbiParameters('address currency, uint256 minAmount')
 
 export interface V4QuoteParams {
@@ -85,7 +86,8 @@ function addressOrder(a: Address, b: Address): [Address, Address] {
 
 /**
  * Build the only V4 plan accepted by TradeRouterV2:
- * Universal Router V4_SWAP -> exact-in single, settle all, take all.
+ * Universal Router V4_SWAP -> exact-in single, native settle-all or
+ * pre-funded ERC-20 settle, then take-all.
  */
 export function buildV4ExactInput(p: V4ExactInputParams): V4ExactInputRoute {
   if (p.tokenIn !== NATIVE_ETH && p.tokenOut !== NATIVE_ETH) {
@@ -109,9 +111,12 @@ export function buildV4ExactInput(p: V4ExactInputParams): V4ExactInputRoute {
     minHopPriceX36: 0n,
     hookData: '0x',
   }])
-  const settleParam = encodeAbiParameters(SETTLE_ALL, [p.tokenIn, routeAmountIn])
+  const settleParam = p.tokenIn === NATIVE_ETH
+    ? encodeAbiParameters(SETTLE_ALL, [p.tokenIn, routeAmountIn])
+    : encodeAbiParameters(SETTLE, [p.tokenIn, routeAmountIn, false])
+  const actions = p.tokenIn === NATIVE_ETH ? '0x060c0f' : '0x060b0f'
   const takeParam = encodeAbiParameters(TAKE_ALL, [p.tokenOut, p.minGrossOut])
-  const nestedPlan = encodeAbiParameters(NESTED_PLAN, ['0x060c0f', [swapParam, settleParam, takeParam]])
+  const nestedPlan = encodeAbiParameters(NESTED_PLAN, [actions, [swapParam, settleParam, takeParam]])
 
   return {
     commands: '0x10',

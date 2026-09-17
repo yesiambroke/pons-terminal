@@ -11,7 +11,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 /** V1 TradeRouter (immutable). */
 export const ROUTER = '0x0102E02037EE0aE13257F9f825777878f967E31B' as const
 /** V2 TradeRouter (curve + migrated V4 path). */
-export const V2_HOODL_ROUTER = '0x6dfC9897a9f9f4CAbbF9F2cB76AE0ef16E4C0750' as const
+export const V2_HOODL_ROUTER = '0xb8f70E2aCf34185A8E72d7bd33e7242Da1E63B06' as const
 
 // Ensure a .env exists before dotenv loads. On first run a fresh WALLET_ENC_KEY
 // (32-byte/64-hex, AES vault master key) and sane defaults are auto-generated so

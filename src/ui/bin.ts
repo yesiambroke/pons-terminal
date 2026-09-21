@@ -11,9 +11,11 @@ import {
 import { loadPrefs, savePrefs } from './store.js'
 import { loadPositionState, savePositionState, type PositionState } from './positions-store.js'
 import { makePublicClient, makeWalletClient } from '../core/chain.js'
+import { resolveLiveTradeSource, startLiveTradeFeed, type LiveTradeFeed } from '../core/live-trade-feed.js'
 import { dispatchTrade } from '../core/dispatch.js'
 import { getBalances, getBalancesBatch } from '../core/router.js'
-import { formatMarketCap, quoteHoldingValue, quoteMarketCap } from '../core/holding-value.js'
+import { formatMarketCap, impliedMarketCapUsd, quoteHoldingValue, quoteMarketCap } from '../core/holding-value.js'
+import { shouldQuoteMarketCap } from './market-cap-refresh.js'
 import {
   applyBuy, applySell, assessPosition, emptyPosition, entryMarketCapEth, evaluateTpSl, formatPnl, formatPnlPercent, moveTrackedTokens, positionKey, reconcilePosition, ruleSellAmount,
   type TrackedPosition, type TpSlRule,
@@ -21,8 +23,8 @@ import {
 import { detectMarket, hasMarketRouteChanged, type DetectedMarket } from '../core/market.js'
 import { readCurveState, type CurveState } from '../core/curve.js'
 import { runCycle, type CycleConfig } from '../engine/cycle.js'
-import type { Row, ActionChip, UIRecord, TermSize, PanelFocus, JobView, VolumeWalletView } from './term.js'
-import { renderFrame, SETTINGS_INTERACTIVE_ROWS, settingsCursorForRow } from './term.js'
+import type { Row, ActionChip, UIRecord, TermSize, PanelFocus, JobView, LiveTradeRow, VolumeWalletView } from './term.js'
+import { renderFrame, SETTINGS_INTERACTIVE_ROWS, settingsCursorForRow, settingsPanelStart } from './term.js'
 import { ERC20_ABI } from '../core/abis.js'
 import { V2_HOODL_ROUTER, WETH } from '../config.js'
 import { formatRouteStatus } from './route-status.js'
@@ -32,10 +34,10 @@ import type { WalletDriver } from '../engine/driver.js'
 import { volumeDaemon } from '../engine/volume.js'
 import type { DispatchModal, BuyStrategy, LadderShape } from './dispatch.js'
 import {
-  createDispatchModal, fieldsFor, normalizeBuyAmount, normalizeSellPct, parseCadence, presetOrderParams, toParams,
+  createDispatchModal, fieldsFor, normalizeBuyAmount, normalizeBuySlippage, normalizeSellPct, parseCadence, presetOrderParams, toParams, toSlippageBps,
 } from './dispatch.js'
 import type { WalletDialog } from './wallet-dialog.js'
-import { checkedWalletIds, commaSeparatedKeys, isWalletDialogConfirmed } from './wallet-dialog.js'
+import { checkedWalletIds, commaSeparatedKeys, isWalletDialogConfirmed, tradeWalletTargets } from './wallet-dialog.js'
 import { copyText } from './clipboard.js'
 
 function write(s: string) { process.stdout.write(s) }
@@ -55,6 +57,18 @@ function compactEth(n?: bigint): string {
     if (Math.abs(value) >= divisor) return `${(value / divisor).toFixed(2)}${suffix} ETH`
   }
   return `${value.toFixed(6)} ETH`
+}
+
+function compactUsd(eth: bigint, ethUsd?: number): string {
+  if (ethUsd === undefined || !Number.isFinite(ethUsd) || ethUsd <= 0) return '—'
+  const usd = Number(formatEther(eth)) * ethUsd
+  if (!Number.isFinite(usd)) return '—'
+  for (const [divisor, suffix] of [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']] as const) {
+    if (Math.abs(usd) >= divisor) return `$${(usd / divisor).toFixed(2)}${suffix}`
+  }
+  if (Math.abs(usd) >= 100) return `$${usd.toFixed(0)}`
+  if (Math.abs(usd) >= 10) return `$${usd.toFixed(1)}`
+  return `$${usd.toFixed(2)}`
 }
 
 export function compactToken(n?: bigint): string {
@@ -84,6 +98,10 @@ export function runApp(opts: RunOpts = {}): void {
   let token = initialPrefs.token
   let tokenName: string | undefined
   let tokenSymbol: string | undefined
+  let liveTrades: LiveTradeRow[] = []
+  let liveFeed: LiveTradeFeed | undefined
+  let liveFeedToken: string | undefined
+  const liveTradeIds = new Set<string>()
   if (!token || !/^0x[0-9a-fA-F]{40}$/.test(token)) token = ''
 
   // ── Engine: the scheduler every operation dispatches into ──────────────────
@@ -136,7 +154,13 @@ export function runApp(opts: RunOpts = {}): void {
         if (!vw) throw new Error(`wallet not found: ${w.id}`)
         const signer = privateKeyToAccount(vaultDecrypt(vw) as `0x${string}`)
         const wc = makeWalletClient(signer)
-        const r = await dispatchTrade(wc, client, { token: opts.token, direction: opts.direction, amount: opts.amount, recipient: signer.address })
+        const r = await dispatchTrade(wc, client, {
+          token: opts.token,
+          direction: opts.direction,
+          amount: opts.amount,
+          recipient: signer.address,
+          slippageBps: opts.direction === 'buy' ? toSlippageBps(defaultBuySlippage) : undefined,
+        })
         recordSwap(w.id, opts.token, opts.direction, opts.amount, r.amountOut)
         logPush(`${r.route} · ${r.hash.slice(0, 10)}…`)
         return { amountOut: r.amountOut, fee: r.fee, hash: r.hash }
@@ -196,7 +220,7 @@ export function runApp(opts: RunOpts = {}): void {
   let cursor = 0
   let input = ''
   let cursorPos = 0
-  let settingEdit: 'token' | 'buy' | 'sell' | null = null
+  let settingEdit: 'token' | 'buy' | 'sell' | 'slip' | null = null
   let tokenEdit = false
   let market: DetectedMarket | undefined
   let curveState: CurveState | undefined
@@ -248,9 +272,14 @@ export function runApp(opts: RunOpts = {}): void {
   let walletScroll: number | undefined = undefined   // wheel-driven scroll offset
   let gasMode: 'fast (+2gwei)' | 'turbo (+5gwei)' | 'normal (+0gwei)' = 'normal (+0gwei)'
   let tpSlAutomationEnabled = initialPrefs.tpSlAutomationEnabled === true
+  let tpSlSeed: 'last' | 'preset' = initialPrefs.tpSlSeed === 'preset' ? 'preset' : 'last'
   let currentTheme: string = initialPrefs.theme || 'dark'
   let defaultBuyAmount = initialPrefs.defaultBuyAmount || '0.001'
   let defaultSellPct = initialPrefs.defaultSellPct || '50'
+  let defaultBuySlippage = initialPrefs.defaultBuySlippage || '2'
+  let defaultTakeProfit = initialPrefs.defaultTakeProfit || '25'
+  let defaultStopLoss = initialPrefs.defaultStopLoss || '10'
+  let defaultTpSlSellPct = initialPrefs.defaultTpSlSellPct || '100'
 
   const reducerActions = (n: number): ActionChip[] => [
     { key: 'b', label: `buy  x${n}` },
@@ -298,7 +327,12 @@ export function runApp(opts: RunOpts = {}): void {
         (token || WETH) as `0x${string}`,
       )
       const reserved = volumeWalletIds()
-      await Promise.all([refreshHoldingValue(bal), refreshPnlAndTpSl(bal), refreshMarketCap()])
+      const quoteCap = shouldQuoteMarketCap({ source: 'poll', liveFeedActive: Boolean(liveFeed) })
+      await Promise.all([
+        refreshHoldingValue(bal),
+        refreshPnlAndTpSl(bal),
+        ...(quoteCap ? [refreshMarketCap()] : []),
+      ])
       rows = wallets.map((wallet) => {
         const balance = bal.get(wallet.id)
         return {
@@ -400,9 +434,12 @@ export function runApp(opts: RunOpts = {}): void {
     }
   }
 
+  let marketCapRefreshing = false
+  let marketCapPending = false
   async function refreshMarketCap() {
-    marketCap = undefined
     if (!token || !market || tokenSupply === undefined) return
+    if (marketCapRefreshing) { marketCapPending = true; return }
+    marketCapRefreshing = true
     const holder = wallets[cursor]?.address as `0x${string}` ?? '0x0000000000000000000000000000000000000000'
     try {
       const cap = await quoteMarketCap(client, market, tokenSupply, holder)
@@ -422,6 +459,13 @@ export function runApp(opts: RunOpts = {}): void {
       marketCap = formatMarketCap(cap.marketCapEth, ethUsd)
     } catch {
       marketCap = 'unavailable'
+    } finally {
+      marketCapRefreshing = false
+      renderNow()
+      if (marketCapPending) {
+        marketCapPending = false
+        void refreshMarketCap()
+      }
     }
   }
 
@@ -442,6 +486,7 @@ export function runApp(opts: RunOpts = {}): void {
         curveState = undefined
       }
       if (changed) {
+        startActiveTokenFeed(resolved, tokenAddress)
         holdingValue = undefined
         marketCap = undefined
         logPush(`route → ${resolved.kind}`)
@@ -468,6 +513,7 @@ export function runApp(opts: RunOpts = {}): void {
     tokenSupply = undefined
     tokenName = undefined
     tokenSymbol = undefined
+    stopActiveTokenFeed()
     if (!token) return
     const tokenAddress = token as `0x${string}`
     try {
@@ -484,6 +530,7 @@ export function runApp(opts: RunOpts = {}): void {
       if (symbolResult?.status === 'fulfilled' && typeof symbolResult.value === 'string') tokenSymbol = symbolResult.value
       if (supplyResult?.status === 'fulfilled' && typeof supplyResult.value === 'bigint') tokenSupply = supplyResult.value
       market = resolved
+      startActiveTokenFeed(resolved, tokenAddress)
       if (resolved.kind === 'v2-curve') {
         const recipient = wallets[cursor]?.address as `0x${string}` | undefined
         if (recipient) curveState = await readCurveState(client, resolved.curve, recipient)
@@ -497,6 +544,52 @@ export function runApp(opts: RunOpts = {}): void {
     } finally {
       renderNow()
     }
+  }
+
+  function startActiveTokenFeed(resolved: DetectedMarket, tokenAddress: `0x${string}`) {
+    liveFeed?.stop()
+    liveFeed = undefined
+    liveFeedToken = tokenAddress
+    liveTrades = []
+    liveTradeIds.clear()
+    if (!process.env.LIVE_FEED_WSS) return
+    void resolveLiveTradeSource(client, resolved).then((source) => {
+      if (token !== tokenAddress || liveFeedToken !== tokenAddress) return
+      liveFeed = startLiveTradeFeed(process.env.LIVE_FEED_WSS, source, (trade) => {
+        if (token !== tokenAddress || liveFeedToken !== tokenAddress) return
+        const id = `${trade.tx ?? 'no-tx'}:${trade.side}:${trade.eth}:${trade.tokens}`
+        if (liveTradeIds.has(id)) return
+        liveTradeIds.add(id)
+        liveTrades.unshift({
+          side: trade.side,
+          eth: num(trade.eth),
+          usd: compactUsd(trade.eth, ethUsd),
+          mc: impliedMarketCapUsd(trade.eth, trade.tokens, tokenSupply, ethUsd),
+          tokens: compactToken(trade.tokens),
+          wallet: trade.wallet ?? 'tx',
+          tx: trade.tx,
+        })
+        if (liveTrades.length > 100) liveTrades = liveTrades.slice(0, 100)
+        if (liveTradeIds.size > 200) {
+          liveTradeIds.clear()
+          for (const row of liveTrades) liveTradeIds.add(`${row.tx ?? 'no-tx'}:${row.side}:${row.eth}:${row.tokens}`)
+        }
+        if (shouldQuoteMarketCap({ source: 'swap', liveFeedActive: true })) void refreshMarketCap()
+        renderNow()
+      }, () => {
+        // The transport reconnects itself. Keep the panel quiet while it recovers.
+      })
+    }).catch(() => {
+      // An unsupported active pair keeps the read-only panel empty.
+    })
+  }
+
+  function stopActiveTokenFeed() {
+    liveFeed?.stop()
+    liveFeed = undefined
+    liveFeedToken = undefined
+    liveTrades = []
+    liveTradeIds.clear()
   }
 
   function routeStatus() {
@@ -516,16 +609,19 @@ export function runApp(opts: RunOpts = {}): void {
       status: `${statusText} · ${selRow(checks.size)}/${wallets.length} · ${refreshing ? '⟳ syncing…' : busy ? 'busy' : 'idle'}`,
       actions: reducerActions(checks.size),
       feedback: activityLog,
+      liveTrades,
       logScroll,
-      input: { value: input, cursor: cursorPos, prompt: settingEdit === 'token' ? 'token CA' : settingEdit === 'buy' ? 'default buy ETH' : settingEdit === 'sell' ? 'default sell %' : 'cmd' },
+      input: { value: input, cursor: cursorPos, prompt: settingEdit === 'token' ? 'token CA' : settingEdit === 'buy' ? 'default buy ETH' : settingEdit === 'sell' ? 'default sell %' : settingEdit === 'slip' ? 'buy slip %' : 'cmd' },
       focus: panel,
       actionCursor,
       settingsCursor,
       gasMode,
       tpSlAutomationEnabled,
+      tpSlSeed,
       theme: currentTheme,
       defaultBuyAmount,
       defaultSellPct,
+      defaultBuySlippage,
       /** mirror the engine's jobs into the JOBS panel */
       jobs: jobsSnapshot(),
       volumeWallets: volumeWalletSnapshot(),
@@ -615,10 +711,10 @@ export function runApp(opts: RunOpts = {}): void {
     return wallets[cursor]
   }
 
-  function beginSettingEdit(kind: 'token' | 'buy' | 'sell') {
+  function beginSettingEdit(kind: 'token' | 'buy' | 'sell' | 'slip') {
     settingEdit = kind
     tokenEdit = kind === 'token'
-    input = kind === 'token' ? '' : kind === 'buy' ? defaultBuyAmount : defaultSellPct
+    input = kind === 'token' ? '' : kind === 'buy' ? defaultBuyAmount : kind === 'sell' ? defaultSellPct : defaultBuySlippage
     cursorPos = input.length
     panel = 'token'
     renderNow()
@@ -663,7 +759,14 @@ export function runApp(opts: RunOpts = {}): void {
 
   // ── DISPATCH modal lifecycle ────────────────────────────────────────────────
   function openModal(kind: DispatchModal['kind']) {
-    modal = createDispatchModal(kind, { defaultBuyAmount, defaultSellPct })
+    modal = createDispatchModal(kind, {
+      defaultBuyAmount,
+      defaultSellPct,
+      tpSlSeed,
+      defaultTakeProfit,
+      defaultStopLoss,
+      defaultTpSlSellPct,
+    })
     modalEdit = null
     renderNow()
   }
@@ -673,7 +776,7 @@ export function runApp(opts: RunOpts = {}): void {
     if (!token) { logPush(`${kind} preset: set a token first (t)`); renderNow(); return }
     const route = routeStatus()
     if (route.blocked) { logPush(`${kind} preset: ${route.blocked}`); renderNow(); return }
-    const selected = wallets.filter((_, index) => checks.has(index))
+    const selected = tradeWalletTargets(wallets, checks, cursor)
     const reserved = volumeWalletIds()
     const targets = selected.filter((wallet) => !reserved.has(wallet.id))
     if (!targets.length) {
@@ -707,7 +810,9 @@ export function runApp(opts: RunOpts = {}): void {
     const activeRoute = routeStatus()
     if (activeRoute.blocked) { modal.error = activeRoute.blocked; renderNow(); return }
     const name = modal.kind
-    const selected = wallets.filter((_, i) => checks.has(i))
+    const selected = name === 'volume'
+      ? wallets.filter((_, i) => checks.has(i))
+      : tradeWalletTargets(wallets, checks, cursor)
     if (name === 'volume' && selected.some((wallet) => executor.isBusy(wallet.id))) {
       modal.error = 'stop active jobs before dedicating wallets to volume'
       renderNow()
@@ -744,6 +849,10 @@ export function runApp(opts: RunOpts = {}): void {
         })
       }
       persistPositions()
+      defaultTakeProfit = String(p.takeProfitPct)
+      defaultStopLoss = String(p.stopLossPct)
+      defaultTpSlSellPct = String(p.sellPct)
+      savePrefs({ defaultTakeProfit, defaultStopLoss, defaultTpSlSellPct })
       logPush(`TP/SL · ${wids.length} wallet${wids.length === 1 ? '' : 's'} · +${p.takeProfitPct}% / -${p.stopLossPct}% · ${p.sellPct}% tracked`)
     } else if (name === 'buy') {
       executor.start('ladderBuy', wids, { ...p, token: tok, note: modal.strategy ?? 'buy' }, buyPlanner(driver, tok))
@@ -800,6 +909,7 @@ export function runApp(opts: RunOpts = {}): void {
 
   function cleanup() {
     stopBlink()
+    stopActiveTokenFeed()
     clearInterval(refreshTimer)
     write('\u001b[?1006l')  // disable SGR mouse
     write('\u001b[?1003l')  // disable any-event mouse tracking
@@ -1000,10 +1110,14 @@ export function runApp(opts: RunOpts = {}): void {
             defaultBuyAmount = normalizeBuyAmount(input)
             savePrefs({ defaultBuyAmount })
             logPush(`default buy → ${defaultBuyAmount} ETH`)
-          } else {
+          } else if (settingEdit === 'sell') {
             defaultSellPct = normalizeSellPct(input)
             savePrefs({ defaultSellPct })
             logPush(`default sell → ${defaultSellPct}%`)
+          } else {
+            defaultBuySlippage = normalizeBuySlippage(input)
+            savePrefs({ defaultBuySlippage })
+            logPush(`buy slip → ${defaultBuySlippage}%`)
           }
           settingEdit = null
           tokenEdit = false
@@ -1107,18 +1221,23 @@ export function runApp(opts: RunOpts = {}): void {
         if (settingsCursor === 0) beginSettingEdit('token')
         else if (settingsCursor === 1) beginSettingEdit('buy')
         else if (settingsCursor === 2) beginSettingEdit('sell')
-        else if (settingsCursor === 3) {
+        else if (settingsCursor === 3) beginSettingEdit('slip')
+        else if (settingsCursor === 4) {
           const modes: Array<'fast (+2gwei)' | 'turbo (+5gwei)' | 'normal (+0gwei)'> = ['fast (+2gwei)', 'turbo (+5gwei)', 'normal (+0gwei)']
           gasMode = modes[(modes.indexOf(gasMode) + 1) % modes.length]
           logPush(`gas mode → ${gasMode}`)
-        } else if (settingsCursor === 4) {
+        } else if (settingsCursor === 5) {
           tpSlAutomationEnabled = !tpSlAutomationEnabled
           savePrefs({ tpSlAutomationEnabled })
           if (!tpSlAutomationEnabled) {
             for (const id of tpSlJobRules.keys()) executor.stop(id)
           }
           logPush(`TP/SL automation → ${tpSlAutomationEnabled ? 'on' : 'off'}`)
-        } else if (settingsCursor === 5) {
+        } else if (settingsCursor === 6) {
+          tpSlSeed = tpSlSeed === 'last' ? 'preset' : 'last'
+          savePrefs({ tpSlSeed })
+          logPush(`TP/SL seed → ${tpSlSeed}`)
+        } else if (settingsCursor === 7) {
           const themes = ['dark', 'tokyo-night', 'obsidian-gold', 'sunset-synth', 'cyberpunk', 'dracula', 'matrix', 'nord']
           currentTheme = themes[(themes.indexOf(currentTheme) + 1) % themes.length]
           savePrefs({ theme: currentTheme })
@@ -1202,7 +1321,8 @@ export function runApp(opts: RunOpts = {}): void {
       const idx = start + (row - 3)
       if (idx >= 0 && idx < wallets.length && idx !== cursor) { cursor = idx; renderNow() }
     } else if (p === 'token') {
-      const idx = settingsCursorForRow(row - 3)
+      const vis = view - 1
+      const idx = settingsCursorForRow(settingsPanelStart(vis, settingsCursor) + (row - 3))
       if (idx !== undefined && idx !== settingsCursor) { settingsCursor = idx; renderNow() }
     } else if (p === 'actions') {
       const idx = row - 3
@@ -1236,7 +1356,7 @@ export function runApp(opts: RunOpts = {}): void {
 
   /** Move a specific panel's selection by dir (clamped at the ends). */
   function moveSlideFor(which: string, dir: number) {
-    if (which === 'token') { settingsCursor = Math.min(5, Math.max(0, settingsCursor + dir)); return }
+    if (which === 'token') { settingsCursor = Math.min(7, Math.max(0, settingsCursor + dir)); return }
     if (which === 'actions') {
       const n = reducerActions(0).length
       actionCursor = Math.min(Math.max(0, n - 1), Math.max(0, actionCursor + dir)); return
@@ -1308,7 +1428,9 @@ export function runApp(opts: RunOpts = {}): void {
     const pwA = Math.max(70, termSize().cols - 2)
     const ca2A = Math.max(26, Math.min(34, Math.floor(pwA * 0.3))) + 2
     const ca1A = pwA - 1 - ca2A
-    const overLog = actStart <= row && row <= actEnd && col <= ca1A
+    const liveWidth = ca1A >= 90 ? Math.max(72, Math.floor(ca1A * 0.56)) : 0
+    const activityWidth = liveWidth > 0 ? ca1A - liveWidth - 1 : ca1A
+    const overLog = actStart <= row && row <= actEnd && col <= activityWidth
 
     if (btn === 64 || btn === 65) {
       const dir = btn === 64 ? -1 : 1      // 64 = wheel up (selection up), 65 = down
@@ -1347,7 +1469,8 @@ export function runApp(opts: RunOpts = {}): void {
           // Column 2: SETTINGS panel clicked — focus panel; only select a
           // setting if the click landed on one of the 4 real setting rows.
           panel = 'token'
-          const sIdx = settingsCursorForRow(row - 3)
+          const vis = view - 1
+          const sIdx = settingsCursorForRow(settingsPanelStart(vis, settingsCursor) + (row - 3))
           if (sIdx !== undefined) {
             settingsCursor = sIdx
             if (sIdx === 0) {
@@ -1357,17 +1480,23 @@ export function runApp(opts: RunOpts = {}): void {
             } else if (sIdx === 2) {
               beginSettingEdit('sell')
             } else if (sIdx === 3) {
+              beginSettingEdit('slip')
+            } else if (sIdx === 4) {
               const modes: Array<'fast (+2gwei)' | 'turbo (+5gwei)' | 'normal (+0gwei)'> = ['fast (+2gwei)', 'turbo (+5gwei)', 'normal (+0gwei)']
               gasMode = modes[(modes.indexOf(gasMode) + 1) % modes.length]
               logPush(`gas mode → ${gasMode}`)
-            } else if (sIdx === 4) {
+            } else if (sIdx === 5) {
               tpSlAutomationEnabled = !tpSlAutomationEnabled
               savePrefs({ tpSlAutomationEnabled })
               if (!tpSlAutomationEnabled) {
                 for (const id of tpSlJobRules.keys()) executor.stop(id)
               }
               logPush(`TP/SL automation → ${tpSlAutomationEnabled ? 'on' : 'off'}`)
-            } else if (sIdx === 5) {
+            } else if (sIdx === 6) {
+              tpSlSeed = tpSlSeed === 'last' ? 'preset' : 'last'
+              savePrefs({ tpSlSeed })
+              logPush(`TP/SL seed → ${tpSlSeed}`)
+            } else if (sIdx === 7) {
               const themes = ['dark', 'tokyo-night', 'obsidian-gold', 'sunset-synth', 'cyberpunk', 'dracula', 'matrix', 'nord']
               currentTheme = themes[(themes.indexOf(currentTheme) + 1) % themes.length]
               savePrefs({ theme: currentTheme })

@@ -20,6 +20,13 @@ export function checkedWalletIds(wallets: readonly { id: string }[], checks: Rea
   return wallets.flatMap((wallet, index) => checks.has(index) ? [wallet.id] : [])
 }
 
+/** Buy/sell targets: checked wallets if any, otherwise the focused row. */
+export function tradeWalletTargets<T>(wallets: readonly T[], checks: ReadonlySet<number>, cursor: number): T[] {
+  if (checks.size > 0) return wallets.filter((_, index) => checks.has(index))
+  const focused = wallets[cursor]
+  return focused ? [focused] : []
+}
+
 export function commaSeparatedKeys(privateKeys: readonly string[]): string {
   return privateKeys.join(',')
 }

@@ -1,7 +1,16 @@
 import type { Address } from 'viem'
+import { encodeAbiParameters, keccak256, parseAbiParameters } from 'viem'
 import type { PublicClientT } from './chain.js'
 import { PONS_V2_FACTORY, WETH } from '../config.js'
 import { PONS_V2_FACTORY_ABI } from './abis.js'
+
+const PONS_V2_MEME_HOOK = '0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044' as const
+const V4_POOL_KEY = parseAbiParameters('address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks')
+
+export function ponsV4PoolId(token: Address, quote: Address, tickSpacing: number): `0x${string}` {
+  const [currency0, currency1] = BigInt(token) < BigInt(quote) ? [token, quote] : [quote, token]
+  return keccak256(encodeAbiParameters(V4_POOL_KEY, [currency0, currency1, 0, tickSpacing, PONS_V2_MEME_HOOK]))
+}
 
 export interface V2LaunchRecord {
   token: Address

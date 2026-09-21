@@ -32,15 +32,32 @@ export interface DispatchModal {
   error?: string
 }
 
+export type TpSlSeed = 'last' | 'preset'
+
+export const TPSL_PRESET = { takeProfit: '25', stopLoss: '10', sellPct: '100' } as const
+
 export interface DispatchDefaults {
   defaultBuyAmount?: string
   defaultSellPct?: string
+  tpSlSeed?: TpSlSeed
+  defaultTakeProfit?: string
+  defaultStopLoss?: string
+  defaultTpSlSellPct?: string
 }
 
 export function createDispatchModal(kind: DispatchKind, defaults: DispatchDefaults = {}): DispatchModal {
   if (kind === 'buy') return { kind, strategy: 'individual', amount: defaults.defaultBuyAmount ?? '0.001', cursor: 0 }
   if (kind === 'sell') return { kind, pct: defaults.defaultSellPct ?? '50', cursor: 0 }
-  if (kind === 'tpsl') return { kind, takeProfit: '25', stopLoss: '10', sellPct: '100', cursor: 0 }
+  if (kind === 'tpsl') {
+    const usePreset = defaults.tpSlSeed === 'preset'
+    return {
+      kind,
+      takeProfit: usePreset ? TPSL_PRESET.takeProfit : (defaults.defaultTakeProfit ?? TPSL_PRESET.takeProfit),
+      stopLoss: usePreset ? TPSL_PRESET.stopLoss : (defaults.defaultStopLoss ?? TPSL_PRESET.stopLoss),
+      sellPct: usePreset ? TPSL_PRESET.sellPct : (defaults.defaultTpSlSellPct ?? TPSL_PRESET.sellPct),
+      cursor: 0,
+    }
+  }
   return { kind, amount: '0.001', cadence: '2-5', cycles: '0', cursor: 0 }
 }
 
@@ -62,6 +79,18 @@ export function normalizeSellPct(value: string): string {
   const pct = value.trim()
   if (!/^\d+(?:\.\d+)?$/.test(pct) || Number(pct) < 0 || Number(pct) > 100) throw new Error('sell percentage must be 0..100')
   return pct
+}
+
+export function normalizeBuySlippage(value: string): string {
+  const pct = value.trim()
+  if (!/^\d+(?:\.\d+)?$/.test(pct)) throw new Error('buy slippage must be 0.1..50')
+  const n = Number(pct)
+  if (!(n >= 0.1 && n <= 50)) throw new Error('buy slippage must be 0.1..50')
+  return pct
+}
+
+export function toSlippageBps(value: string): bigint {
+  return BigInt(Math.round(Number(normalizeBuySlippage(value)) * 100))
 }
 
 /** Which user-editable fields exist for a given kind. Ordered. */

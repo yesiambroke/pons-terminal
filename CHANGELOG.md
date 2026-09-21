@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2026-09-21
+
+Changes since `879bd6d` (`latest update V0.2`). Not pushed yet.
+
+### Added
+
+- **Active-token Live Trades**: a read-only lower-panel feed streams confirmed on-chain buys and sells for the selected token, separate from local terminal activity. It follows Curve, V1 pool, and migrated V4 routes, shows ETH, USD, implied USD market cap, and token size on every row, and keeps only a bounded in-memory buffer.
+- **SETTINGS `Seed`**: choose whether `k` opens last confirmed TP/SL values or the factory 25/10/100 preset. Last confirmed thresholds persist locally.
+- **SETTINGS `Slip`**: persisted buy-only slippage (default 2%, range 0.1–50%). `b`/`[` apply it to V1, curve, and V4 buys; sells keep the 2% floor.
+
+### Changed
+
+- V1 sells unwrap the received WETH back to native ETH for the signing wallet. Curve and V4 sells already settle in ETH.
+- SETTINGS `MCap` keeps the existing one-token net-sell quote and refreshes on confirmed live-feed swaps instead of the three-second wallet poll when the WSS feed is connected.
+- Buy/Sell (`b`/`s`) and preset `[`/`]` use the focused wallet when none are checked, and still target every checked wallet when one or more are selected.
+- SETTINGS scrolls so extra rows (`Slip`, `Seed`, Theme) stay reachable in the panel viewport.
+
+### Fixed
+
+- V4 live-trade side detection uses caller `BalanceDelta` (token paid in = sell). V3 still uses pool deltas.
+
+### Notes
+
+- Live Trades `MC` is fill-implied FDV from someone else's swap size. SETTINGS `MCap` stays the one-token net-sell quote.
+- `LIVE_FEED_WSS` is local `.env` only and is not part of the source tree.
+
 ## 2026-09-16
 
 First dated changelog entry. It records the changes prepared since the prior GitHub release.

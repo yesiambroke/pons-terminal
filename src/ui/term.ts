@@ -45,6 +45,16 @@ export interface JobView {
   note?: string
 }
 
+export interface LiveTradeRow {
+  side: 'buy' | 'sell'
+  eth: string
+  usd: string
+  mc: string
+  tokens: string
+  wallet: string
+  tx?: string
+}
+
 export type PanelFocus = 'wallets' | 'token' | 'actions' | 'jobs'
 
 export interface UIRecord {
@@ -58,6 +68,8 @@ export interface UIRecord {
   status: string
   actions: ActionChip[]
   feedback: string[]
+  /** Confirmed on-chain swaps for the active token. Read-only, newest first. */
+  liveTrades?: LiveTradeRow[]
   logScroll?: number
   input: { value: string; cursor: number; prompt: string }
   focus?: PanelFocus
@@ -67,7 +79,9 @@ export interface UIRecord {
   theme?: string
   defaultBuyAmount?: string
   defaultSellPct?: string
+  defaultBuySlippage?: string
   tpSlAutomationEnabled?: boolean
+  tpSlSeed?: 'last' | 'preset'
   jobs?: JobView[]
   volumeWallets?: VolumeWalletView[]
   /** Index into `jobs` of the focused job (JOBS panel highlight). */
@@ -99,7 +113,7 @@ export interface UIRecord {
 export interface TermSize { cols: number; rows: number }
 
 /** Physical SETTINGS lines that are actual controls, not read-only route status. */
-export const SETTINGS_INTERACTIVE_ROWS = [0, 6, 7, 8, 9, 10] as const
+export const SETTINGS_INTERACTIVE_ROWS = [0, 6, 7, 8, 9, 10, 11, 12] as const
 
 export function settingsRowForCursor(cursor: number): number {
   return SETTINGS_INTERACTIVE_ROWS[Math.max(0, Math.min(cursor, SETTINGS_INTERACTIVE_ROWS.length - 1))]!
@@ -108,6 +122,14 @@ export function settingsRowForCursor(cursor: number): number {
 export function settingsCursorForRow(row: number): number | undefined {
   const cursor = SETTINGS_INTERACTIVE_ROWS.indexOf(row as typeof SETTINGS_INTERACTIVE_ROWS[number])
   return cursor === -1 ? undefined : cursor
+}
+
+/** Visible SETTINGS offset so the focused control stays in the panel viewport. */
+export function settingsPanelStart(vis: number, settingsCursor = 0, lineCount = 13): number {
+  const focused = settingsRowForCursor(settingsCursor)
+  const maxStart = Math.max(0, lineCount - vis)
+  const start = focused < vis ? 0 : focused - vis + 1
+  return Math.min(Math.max(0, start), maxStart)
 }
 
 // ─── Color Themes ─────────────────────────────────────────────────────────────
@@ -140,6 +162,10 @@ function strip(s: string): string { return s.replace(ansiRe, '') }
 
 function shortAddress(address: string): string {
   return address.length > 16 ? `${address.slice(0, 10)}…${address.slice(-6)}` : address
+}
+
+function compactWallet(address: string): string {
+  return address.length > 12 ? `${address.slice(0, 7)}…${address.slice(-5)}` : address
 }
 
 function clipText(text: string, limit: number): string {
@@ -310,7 +336,9 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
       ? 'TOKEN CONTRACT ADDRESS'
       : s.input.prompt === 'default buy ETH'
         ? 'DEFAULT BUY AMOUNT (ETH)'
-        : 'DEFAULT SELL PERCENTAGE'
+        : s.input.prompt === 'buy slip %'
+          ? 'BUY SLIPPAGE (%)'
+          : 'DEFAULT SELL PERCENTAGE'
     setLines.push(`  ▍ ${editTitle}`, `  ${s.input.value || ' '}`, '', `  ⏎ Save   Esc Cancel`)
   } else {
     const contract = s.token ? shortAddress(s.token) : 'Set Token CA'
@@ -324,8 +352,10 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
       `${LBL('MCap')}${s.marketCap ?? (s.routeBlocked ? 'unavailable' : '—')}`,
       `${LBL('Buy')}${s.defaultBuyAmount ?? '0.001'} ETH`,
       `${LBL('Sell')}${s.defaultSellPct ?? '50'}%`,
+      `${LBL('Slip')}${s.defaultBuySlippage ?? '2'}%`,
       `${LBL('Gas')}${s.gasMode ?? 'fast'}`,
       `${LBL('TP/SL')}${s.tpSlAutomationEnabled ? 'on' : 'off'}`,
+      `${LBL('Seed')}${s.tpSlSeed === 'preset' ? 'preset' : 'last'}`,
       `${LBL('Theme')}${themeName}`,
     )
   }
@@ -341,12 +371,15 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
   // paint the three body columns, one row at a time (body starts row 3)
   const wScr = s.rows.length > L.view - 1       // wallets overflow → reserve last col
   const wW = wScr ? L.ci1 + 1 : L.ci1 + 2        // text width (scrollbar takes last col)
-  for (let bi = 0; bi < L.view - 1; bi++) {
+  const vis = L.view - 1
+  const setStart = isEditing ? 0 : settingsPanelStart(vis, s.settingsCursor ?? 0, setLines.length)
+  const focusedSetting = settingsRowForCursor(s.settingsCursor ?? 0)
+  for (let bi = 0; bi < vis; bi++) {
     const y = 3 + bi
     const rBg1 = (s.rows[start + bi] && start + bi === cursor && fW) ? T.BGSL : bg1
     let x = 1
     paintCell(b, x, y, wW, (walletLines[bi] ?? ''), rBg1, T); x += L.ci1 + 2 + 1
-    paintCell(b, x, y, L.ci2 + 2, (setLines[bi] ?? ''), (fT && !isEditing && bi === settingsRowForCursor(s.settingsCursor ?? 0)) ? T.BGSL : bg2, T); x += L.ci2 + 2 + 1
+    paintCell(b, x, y, L.ci2 + 2, (setLines[setStart + bi] ?? ''), (fT && !isEditing && setStart + bi === focusedSetting) ? T.BGSL : bg2, T); x += L.ci2 + 2 + 1
     paintCell(b, x, y, L.ci3 + 2, (actLines[bi] ?? ''), bg3, T)
   }
 
@@ -366,13 +399,21 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
     }
   }
 
-  // ── bottom: ACTIVITY (left) + JOBS (right), separated by a BGS gutter ─────
+  // ── bottom: ACTIVITY + LIVE TRADES + JOBS, separated by BGS gutters ────────
   // spacer row after top body, then titles, then body
   const btY = 3 + (L.view - 1) + 1          // row after a 1-row gap
   const byY = btY + 1                       // body starts next row
+  const liveWidth = L.ca1 >= 90 ? Math.max(72, Math.floor(L.ca1 * 0.56)) : 0
+  const activityWidth = liveWidth > 0 ? L.ca1 - liveWidth - 1 : L.ca1
+  const liveCols = { side: 11, eth: 10, usd: 7, mc: 8, tok: 8, wallet: 13 }
+  const liveTradeText = (side: string, eth: string, usd: string, mc: string, tokens: string, wallet: string): string =>
+    ` ${fitLeft(side, liveCols.side)}  ${fitRight(eth, liveCols.eth)}  ${fitRight(usd, liveCols.usd)}  ${fitRight(mc, liveCols.mc)}  ${fitRight(tokens, liveCols.tok)}  ${fitLeft(wallet, liveCols.wallet)}`
   // titles
   let x = 1
-  paintCell(b, x, btY, L.ca1, '  ACTIVITY', T.BGH, T); x += L.ca1 + 1
+  paintCell(b, x, btY, activityWidth, '  ACTIVITY', T.BGH, T); x += activityWidth + 1
+  if (liveWidth > 0) {
+    paintCell(b, x, btY, liveWidth, liveTradeText('LIVE TRADES', 'ETH', 'USD', 'MC', 'TOK', 'WALLET'), T.BGH, T); x += liveWidth + 1
+  }
   paintCell(b, x, btY, L.ca2, '  VOLUME WALLETS · JOBS', T.BGH, T)
 
   // JOBS content
@@ -414,24 +455,42 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
     else actBody.push('')
   }
 
+  // LIVE TRADES content: read-only, active-token swaps, newest first.
+  const liveTradeLines: { side?: 'buy' | 'sell'; text: string }[] = (s.liveTrades ?? []).slice(0, L.act).map((trade) => ({
+    side: trade.side,
+    text: liveTradeText(
+      trade.side.toUpperCase(),
+      trade.eth,
+      trade.usd,
+      trade.mc,
+      trade.tokens,
+      compactWallet(trade.wallet),
+    ),
+  }))
+  if (liveTradeLines.length === 0) liveTradeLines.push({ side: undefined, text: '  waiting for active-token trades' })
+
   const aScr = fe.length > L.act                // activity overflow → reserve last col
-  const aW = aScr ? L.ca1 - 1 : L.ca1            // text width (scrollbar takes last col)
+  const activityTextWidth = aScr ? activityWidth - 1 : activityWidth
   for (let ri = 0; ri < L.act; ri++) {
     const y = byY + ri
     let x = 1
     const jobBg = fJ ? T.BGF : T.BGP
+    paintCell(b, x, y, activityTextWidth, (actBody[ri] ?? ''), T.BGP, T); x += activityWidth + 1
+    if (liveWidth > 0) {
+      const live = liveTradeLines[ri]
+      const liveBg = live?.side === 'buy' ? 22 : live?.side === 'sell' ? 52 : T.BGP
+      paintCell(b, x, y, liveWidth, (live?.text ?? ''), liveBg, T); x += liveWidth + 1
+    }
     // last row of the JOBS panel = control tips (not a job row)
     if (ri === L.act - 1) {
-      paintCell(b, x, y, aW, (actBody[ri] ?? ''), T.BGP, T); x += L.ca1 + 1
       paintCell(b, x, y, L.ca2, ' p pause · r resume · x stop', T.BGH, T)
       continue
     }
-    paintCell(b, x, y, aW, (actBody[ri] ?? ''), T.BGP, T); x += L.ca1 + 1
     const jrowBg = (fJ && jobs[ri] && ri === (s.jobCursor ?? 0)) ? T.BGSL : jobBg
     paintCell(b, x, y, L.ca2, (jobLines[ri] ?? ''), jrowBg, T)
   }
 
-  // ── ACTIVITY scrollbar — INSIDE the panel's last column (x=aW+1) ────────────
+  // ── ACTIVITY scrollbar — INSIDE the panel's last column ─────────────────────
   if (aScr) {
     const thumbH = Math.max(1, Math.round((L.act * L.act) / fe.length))
     const trackH = L.act - thumbH
@@ -440,7 +499,7 @@ export function renderFrame(s: UIRecord, size?: TermSize): string {
     const thumbY = byY + Math.round(trackH * (1 - off))
     for (let yy = byY; yy < byY + L.act; yy++) {
       const inThumb = yy >= thumbY && yy < thumbY + thumbH
-      b.set(1 + aW, yy, inThumb
+      b.set(1 + activityTextWidth, yy, inThumb
         ? { ch: '█', fg: T.CCY, bg: T.CCY, bold: false, dim: false }
         : { ch: '│', fg: T.CDM, bg: T.BGP, bold: false, dim: true })
     }

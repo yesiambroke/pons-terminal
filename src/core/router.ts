@@ -50,6 +50,31 @@ export async function wrapIfShort(walletClient: WalletClientT, publicClient: Pub
   await publicClient.waitForTransactionReceipt({ hash })
 }
 
+/** Unwrap signer WETH to native ETH. No-ops when the requested amount is 0. */
+export async function unwrapWeth(
+  walletClient: WalletClientT,
+  publicClient: PublicClientT,
+  amount?: bigint,
+): Promise<Address | undefined> {
+  const owner = walletClient.account!.address
+  const bal = (await publicClient.readContract({
+    address: WETH,
+    abi: ERC20_ABI,
+    functionName: 'balanceOf',
+    args: [owner],
+  })) as bigint
+  const toUnwrap = amount === undefined ? bal : amount
+  if (toUnwrap <= 0n) return undefined
+  const hash = (await walletClient.writeContract({
+    address: WETH,
+    abi: WETH_ABI,
+    functionName: 'withdraw',
+    args: [toUnwrap],
+  })) as Address
+  await waitTx(publicClient, hash)
+  return hash
+}
+
 export async function quoteOut(
   publicClient: PublicClientT,
   tokenIn: Address,
@@ -125,6 +150,8 @@ export interface SwapParams {
   amount: bigint
   /** wallet that receives the swapped output */
   recipient: Address
+  /** Optional min-out slippage in bps. Defaults to the global 2% SLIPPAGE. */
+  slippageBps?: bigint
 }
 
 export interface SwapResult {
@@ -153,7 +180,8 @@ export async function hoodlSwap(
     const swapAmt = p.amount - fee
     const rawOut = await quoteOut(publicClient, WETH, p.token, swapAmt)
     if (rawOut === 0n) throw new Error('buy returned 0 — amount too small')
-    const minOut = rawOut - (rawOut * SLIPPAGE) / 10000n
+    const slippageBps = p.slippageBps ?? SLIPPAGE
+    const minOut = rawOut - (rawOut * slippageBps) / 10000n
 
     await wrapIfShort(walletClient, publicClient, p.amount)
     await approveIfNeeded(walletClient, publicClient, WETH, ROUTER!, p.amount)
@@ -204,6 +232,10 @@ export async function hoodlSwap(
     functionName: 'balanceOf',
     args: [p.recipient],
   })) as bigint) - wethBefore
+
+  if (wethOut > 0n && p.recipient.toLowerCase() === walletClient.account!.address.toLowerCase()) {
+    await unwrapWeth(walletClient, publicClient, wethOut)
+  }
 
   return { hash, amountOut: wethOut, fee }
 }

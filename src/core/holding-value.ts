@@ -84,6 +84,16 @@ export function formatMarketCap(marketCapEth: bigint, ethUsd?: number): string {
   return `${ethText} · $${compactNumber(eth * ethUsd)}`
 }
 
+/** Fully diluted USD cap implied by one confirmed swap's ETH/token size. */
+export function impliedMarketCapUsd(eth: bigint, tokens: bigint, supply?: bigint, ethUsd?: number): string {
+  if (supply === undefined || eth <= 0n || tokens <= 0n || supply <= 0n) return '—'
+  if (ethUsd === undefined || !Number.isFinite(ethUsd) || ethUsd <= 0) return '—'
+  const marketCapEth = eth * supply / tokens
+  const ethNum = Number(marketCapEth) / 1e18
+  if (!Number.isFinite(ethNum) || ethNum <= 0) return '—'
+  return `$${compactNumber(ethNum * ethUsd)}`
+}
+
 /**
  * Read-only fully diluted ETH estimate from the current net sale price of one
  * whole token unit. It is an estimate, not the output of a sale of total supply.

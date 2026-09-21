@@ -9,7 +9,12 @@ export interface Prefs {
   theme?: string
   defaultBuyAmount?: string
   defaultSellPct?: string
+  defaultBuySlippage?: string
   tpSlAutomationEnabled?: boolean
+  tpSlSeed?: 'last' | 'preset'
+  defaultTakeProfit?: string
+  defaultStopLoss?: string
+  defaultTpSlSellPct?: string
 }
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
